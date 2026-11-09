@@ -1,0 +1,915 @@
+name: Build APK
+
+# Один файл: положи его в репозиторий как .github/workflows/build.yml
+# Он сам создаёт pubspec.yaml и lib/main.dart, добавляет разрешения и собирает APK.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Flutter project
+        run: flutter create --platforms=android --project-name yandex_golosa --org ru.golosa app
+
+      - name: Write pubspec.yaml
+        working-directory: app
+        run: |
+          cat > pubspec.yaml <<'GOLOSA_EOF'
+          name: yandex_golosa
+          description: Яндекс голоса — озвучка запросов на устройствах Яндекса и Bluetooth-колонках
+          publish_to: none
+          version: 1.0.0+1
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            webview_flutter: ^4.7.0
+            webview_cookie_manager: ^2.0.6
+            http: ^1.2.0
+            flutter_tts: ^4.0.2
+            app_settings: ^5.1.1
+
+          flutter:
+            uses-material-design: true
+          GOLOSA_EOF
+
+      - name: Write lib/main.dart
+        working-directory: app
+        run: |
+          cat > lib/main.dart <<'GOLOSA_EOF'
+          import 'dart:convert';
+
+          import 'package:app_settings/app_settings.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter_tts/flutter_tts.dart';
+          import 'package:http/http.dart' as http;
+          import 'package:webview_cookie_manager/webview_cookie_manager.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() => runApp(const GolosaApp());
+
+          class GolosaApp extends StatelessWidget {
+            const GolosaApp({super.key});
+
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+                  title: 'Яндекс голоса',
+                  debugShowCheckedModeBanner: false,
+                  theme: ThemeData(
+                    useMaterial3: true,
+                    brightness: Brightness.dark,
+                    colorSchemeSeed: const Color(0xFFFFCC00),
+                  ),
+                  home: const LoginPage(),
+                );
+          }
+
+          // ───────────────────────── Голоса ─────────────────────────
+
+          class Voice {
+            const Voice(this.name, this.pitch, this.rate, this.dance, {this.kisi = false});
+            final String name;
+            final double pitch;
+            final double rate;
+            final int dance; // 0 — ровно, 1 — зигзаг, 2 — нарастание
+            final bool kisi;
+          }
+
+          List<Voice> buildVoices() {
+            const names = [
+              'Алиса', 'Филипп', 'Ермил', 'Джейн', 'Мадирус', 'Омаж', 'Захар',
+              'Алёна', 'Эркан', 'Ник', 'Кирилл', 'Оксана', 'Саша', 'Лера',
+              'Маша', 'Дима', 'Борис', 'Влад', 'Ася', 'Тимур',
+            ];
+            final base = <Voice>[
+              for (var i = 0; i < names.length; i++)
+                Voice(names[i], 0.6 + (i % 5) * 0.25, 0.4 + (i % 4) * 0.1, 0),
+            ];
+            final kisi = <Voice>[];
+            const pitches = [1.2, 1.4, 1.6, 1.8, 2.0];
+            const rates = [0.35, 0.45, 0.55, 0.65, 0.75];
+            var n = 1;
+            for (final dance in [1, 2]) {
+              for (final p in pitches) {
+                for (final r in rates) {
+                  kisi.add(Voice('Киси $n', p, r, dance, kisi: true));
+                  n++;
+                }
+              }
+            }
+            return [...base, ...kisi]; // 20 + 50
+          }
+
+          // ───────────────────────── API Яндекса (неофициальный) ─────────────────────────
+
+          class YDevice {
+            YDevice(this.id, this.name, this.type);
+            final String id;
+            final String name;
+            final String type;
+          }
+
+          class YandexApi {
+            YandexApi(this.cookie);
+            final String cookie;
+            String? _csrf;
+
+            Map<String, String> get _h => {
+                  'Cookie': cookie,
+                  'User-Agent':
+                      'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36',
+                  if (_csrf != null) 'x-csrf-token': _csrf!,
+                };
+
+            Future<void> _token() async {
+              final r = await http.get(Uri.parse('https://yandex.ru/quasar'), headers: _h);
+              final m = RegExp(r'"csrfToken2":"(.+?)"').firstMatch(r.body);
+              if (m == null) throw Exception('Не получен csrf-токен');
+              _csrf = m.group(1);
+            }
+
+            Future<List<YDevice>> devices() async {
+              final r = await http.get(
+                Uri.parse('https://iot.quasar.yandex.ru/m/v3/user/devices'),
+                headers: _h,
+              );
+              if (r.statusCode != 200) throw Exception('Устройства: ${r.statusCode}');
+              final json = jsonDecode(utf8.decode(r.bodyBytes));
+              final found = <String, YDevice>{};
+              void walk(dynamic node) {
+                if (node is Map) {
+                  if (node['id'] is String && node['name'] is String && node['type'] is String) {
+                    found[node['id']] = YDevice(node['id'], node['name'], node['type']);
+                  }
+                  node.values.forEach(walk);
+                } else if (node is List) {
+                  node.forEach(walk);
+                }
+              }
+
+              walk(json['households'] ?? json);
+              return found.values.toList();
+            }
+
+            /// Озвучить текст на устройстве через временный сценарий.
+            Future<void> speak(String deviceId, String text) async {
+              await _token();
+              final headers = {..._h, 'Content-Type': 'application/json'};
+              final create = await http.post(
+                Uri.parse('https://iot.quasar.yandex.ru/m/user/scenarios'),
+                headers: headers,
+                body: jsonEncode({
+                  'name': 'golosa_tmp',
+                  'icon': 'home',
+                  'triggers': [
+                    {'type': 'scenario.trigger.voice', 'value': 'киси голоса'}
+                  ],
+                  'steps': [
+                    {
+                      'type': 'scenarios.steps.actions',
+                      'parameters': {
+                        'requested_speaker_capabilities': [],
+                        'launch_devices': [
+                          {
+                            'id': deviceId,
+                            'capabilities': [
+                              {
+                                'type': 'devices.capabilities.quasar.server_action',
+                                'state': {'instance': 'phrase_action', 'value': text},
+                              }
+                            ],
+                          }
+                        ],
+                      },
+                    }
+                  ],
+                }),
+              );
+              final sid = jsonDecode(create.body)['scenario_id'];
+              if (sid == null) throw Exception('Сценарий не создан (${create.statusCode})');
+              await http.post(
+                Uri.parse('https://iot.quasar.yandex.ru/m/user/scenarios/$sid/actions'),
+                headers: headers,
+              );
+              await http.delete(
+                Uri.parse('https://iot.quasar.yandex.ru/m/user/scenarios/$sid'),
+                headers: headers,
+              );
+            }
+          }
+
+          // ───────────────────────── Вход ─────────────────────────
+
+          class LoginPage extends StatefulWidget {
+            const LoginPage({super.key});
+
+            @override
+            State<LoginPage> createState() => _LoginPageState();
+          }
+
+          class _LoginPageState extends State<LoginPage> {
+            late final WebViewController _web;
+            bool _busy = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _web = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..loadRequest(Uri.parse(
+                    'https://passport.yandex.ru/auth?retpath=https%3A%2F%2Fyandex.ru'));
+            }
+
+            Future<void> _loggedIn() async {
+              setState(() => _busy = true);
+              try {
+                final cm = WebviewCookieManager();
+                final all = <String, String>{};
+                for (final url in [
+                  'https://yandex.ru',
+                  'https://passport.yandex.ru',
+                  'https://iot.quasar.yandex.ru',
+                ]) {
+                  for (final c in await cm.getCookies(url)) {
+                    all[c.name] = c.value;
+                  }
+                }
+                final header = all.entries.map((e) => '${e.key}=${e.value}').join('; ');
+                final api = YandexApi(header);
+                final devices = await api.devices();
+                if (!mounted) return;
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute(builder: (_) => HomePage(api: api, devices: devices)),
+                );
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Вход не найден: $e')),
+                  );
+                }
+              } finally {
+                if (mounted) setState(() => _busy = false);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(
+                    title: const Text('Яндекс ID'),
+                    actions: [
+                      Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: FilledButton(
+                          onPressed: _busy ? null : _loggedIn,
+                          child: _busy
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : const Text('Я вошёл'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  body: WebViewWidget(controller: _web),
+                );
+          }
+
+          // ───────────────────────── Главный экран ─────────────────────────
+
+          class HomePage extends StatefulWidget {
+            const HomePage({super.key, required this.api, required this.devices});
+            final YandexApi api;
+            final List<YDevice> devices;
+
+            @override
+            State<HomePage> createState() => _HomePageState();
+          }
+
+          class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin {
+            final _tts = FlutterTts();
+            final _text = TextEditingController();
+            final _voices = buildVoices();
+            late final AnimationController _dance =
+                AnimationController(vsync: this, duration: const Duration(milliseconds: 450));
+
+            YDevice? _device; // null — динамик телефона / Bluetooth
+            int _voiceIdx = 0;
+            bool _speaking = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _tts.setLanguage('ru-RU');
+              _tts.awaitSpeakCompletion(true);
+            }
+
+            @override
+            void dispose() {
+              _dance.dispose();
+              _text.dispose();
+              super.dispose();
+            }
+
+            Future<void> _say() async {
+              final text = _text.text.trim();
+              if (text.isEmpty || _speaking) return;
+              final v = _voices[_voiceIdx];
+              setState(() => _speaking = true);
+              _dance.repeat(reverse: true);
+              try {
+                if (_device != null) {
+                  await widget.api.speak(_device!.id, text);
+                } else {
+                  await _tts.setVolume(1.0); // максимально громко
+                  await _tts.setSpeechRate(v.rate);
+                  final words = text.split(RegExp(r'\s+'));
+                  for (var i = 0; i < words.length; i += 2) {
+                    final chunk = words.skip(i).take(2).join(' ');
+                    var p = v.pitch;
+                    if (v.dance == 1) p += (i ~/ 2).isEven ? 0.0 : 0.3;
+                    if (v.dance == 2) p += ((i ~/ 2) % 5) * 0.12;
+                    await _tts.setPitch(p.clamp(0.5, 2.0));
+                    await _tts.speak(chunk);
+                  }
+                }
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(SnackBar(content: Text('Ошибка: $e')));
+                }
+              } finally {
+                _dance.stop();
+                if (mounted) setState(() => _speaking = false);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('Яндекс голоса')),
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    Center(
+                      child: AnimatedBuilder(
+                        animation: _dance,
+                        builder: (_, child) => Transform.rotate(
+                          angle: (_dance.value - 0.5) * 0.6,
+                          child: Transform.translate(
+                              offset: Offset(0, -12 * _dance.value), child: child),
+                        ),
+                        child: const Text('🐱', style: TextStyle(fontSize: 64)),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<YDevice?>(
+                      value: _device,
+                      decoration: const InputDecoration(
+                          labelText: 'Устройство', border: OutlineInputBorder()),
+                      items: [
+                        const DropdownMenuItem(
+                            value: null, child: Text('Этот телефон / Bluetooth')),
+                        for (final d in widget.devices)
+                          DropdownMenuItem(value: d, child: Text(d.name)),
+                      ],
+                      onChanged: (d) => setState(() => _device = d),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.bluetooth),
+                      label: const Text('Подключить Bluetooth'),
+                      onPressed: () =>
+                          AppSettings.openAppSettings(type: AppSettingsType.bluetooth),
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _text,
+                      minLines: 2,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                          labelText: 'Любой запрос', border: OutlineInputBorder()),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text('Голоса (20)', style: TextStyle(fontWeight: FontWeight.bold)),
+                    _chips(0, 20),
+                    const SizedBox(height: 12),
+                    const Text('Киси: громкий, танцующий (50)',
+                        style: TextStyle(fontWeight: FontWeight.bold)),
+                    _chips(20, _voices.length),
+                    const SizedBox(height: 24),
+                    FilledButton.icon(
+                      icon: const Icon(Icons.volume_up),
+                      label: Text(_speaking ? 'Говорю…' : 'Сказать'),
+                      onPressed: _speaking ? null : _say,
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _chips(int from, int to) => Wrap(
+                  spacing: 6,
+                  children: [
+                    for (var i = from; i < to; i++)
+                      ChoiceChip(
+                        label: Text(_voices[i].name),
+                        selected: _voiceIdx == i,
+                        onSelected: (_) => setState(() => _voiceIdx = i),
+                      ),
+                  ],
+                );
+          }
+          GOLOSA_EOF
+
+      - name: Add permissions to AndroidManifest
+        working-directory: app
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i '0,/<application/s//<uses-permission android:name="android.permission.INTERNET"\/>\n    <uses-permission android:name="android.permission.BLUETOOTH"\/>\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"\/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"\/>\n    <application/' "$M"
+
+      - name: Build APK
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yandex-golosa-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apkname: Build APK
+
+# Один файл: положи его в репозиторий как .github/workflows/build.yml
+# Он сам создаёт pubspec.yaml и lib/main.dart, добавляет разрешения и собирает APK.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Flutter project
+        run: flutter create --platforms=android --project-name yandex_golosa --org ru.golosa app
+
+      - name: Write pubspec.yaml
+        working-directory: app
+        run: |
+          cat > pubspec.yaml <<'GOLOSA_EOF'
+          name: yandex_golosa
+          description: Яндекс голоса — озвучка запросов на устройствах Яндекса и Bluetooth-колонках
+          publish_to: none
+          version: 1.0.0+1
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            webview_flutter: ^4.7.0
+            webview_cookie_manager: ^2.0.6
+            http: ^1.2.0
+            flutter_tts: ^4.0.2
+            app_settings: ^5.1.1
+
+          flutter:
+            uses-material-design: true
+          GOLOSA_EOF
+
+      - name: Write lib/main.dart
+        working-directory: app
+        run: |
+          cat > lib/main.dart <<'GOLOSA_EOF'
+          import 'dart:convert';
+
+          import 'package:app_settings/app_settings.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter_tts/flutter_tts.dart';
+          import 'package:http/http.dart' as http;
+          import 'package:webview_cookie_manager/webview_cookie_manager.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() => runApp(const GolosaApp());
+
+          class GolosaApp extends StatelessWidget {
+            const GolosaApp({super.key});
+
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+                  title: 'Яндекс голоса',
+                  debugShowCheckedModeBanner: false,
+                  theme: ThemeData(
+                    useMaterial3: true,
+                    brightness: Brightness.dark,
+                    colorSchemeSeed: const Color(0xFFFFCC00),
+                  ),
+                  home: const LoginPage(),
+                );
+          }
+
+          // ───────────────────────── Голоса ─────────────────────────
+
+          class Voice {
+            const Voice(this.name, this.pitch, this.rate, this.dance, {this.kisi = false});
+            final String name;
+            final double pitch;
+            final double rate;
+            final int dance; // 0 — ровно, 1 — зигзаг, 2 — нарастание
+            final bool kisi;
+          }
+
+          List<Voice> buildVoices() {
+            const names = [
+              'Алиса', 'Филипп', 'Ермил', 'Джейн', 'Мадирус', 'Омаж', 'Захар',
+              'Алёна', 'Эркан', 'Ник', 'Кирилл', 'Оксана', 'Саша', 'Лера',
+              'Маша', 'Дима', 'Борис', 'Влад', 'Ася', 'Тимур',
+            ];
+            final base = <Voice>[
+              for (var i = 0; i < names.length; i++)
+                Voice(names[i], 0.6 + (i % 5) * 0.25, 0.4 + (i % 4) * 0.1, 0),
+            ];
+            final kisi = <Voice>[];
+            const pitches = [1.2, 1.4, 1.6, 1.8, 2.0];
+            const rates = [0.35, 0.45, 0.55, 0.65, 0.75];
+            var n = 1;
+            for (final dance in [1, 2]) {
+              for (final p in pitches) {
+                for (final r in rates) {
+                  kisi.add(Voice('Киси $n', p, r, dance, kisi: true));
+                  n++;
+                }
+              }
+            }
+            return [...base, ...kisi]; // 20 + 50
+          }
+
+          // ───────────────────────── API Яндекса (неофициальный) ─────────────────────────
+
+          class YDevice {
+            YDevice(this.id, this.name, this.type);
+            final String id;
+            final String name;
+            final String type;
+          }
+
+          class YandexApi {
+            YandexApi(this.cookie);
+            final String cookie;
+            String? _csrf;
+
+            Map<String, String> get _h => {
+                  'Cookie': cookie,
+                  'User-Agent':
+                      'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36',
+                  if (_csrf != null) 'x-csrf-token': _csrf!,
+                };
+
+            Future<void> _token() async {
+              final r = await http.get(Uri.parse('https://yandex.ru/quasar'), headers: _h);
+              final m = RegExp(r'"csrfToken2":"(.+?)"').firstMatch(r.body);
+              if (m == null) throw Exception('Не получен csrf-токен');
+              _csrf = m.group(1);
+            }
+
+            Future<List<YDevice>> devices() async {
+              final r = await http.get(
+                Uri.parse('https://iot.quasar.yandex.ru/m/v3/user/devices'),
+                headers: _h,
+              );
+              if (r.statusCode != 200) throw Exception('Устройства: ${r.statusCode}');
+              final json = jsonDecode(utf8.decode(r.bodyBytes));
+              final found = <String, YDevice>{};
+              void walk(dynamic node) {
+                if (node is Map) {
+                  if (node['id'] is String && node['name'] is String && node['type'] is String) {
+                    found[node['id']] = YDevice(node['id'], node['name'], node['type']);
+                  }
+                  node.values.forEach(walk);
+                } else if (node is List) {
+                  node.forEach(walk);
+                }
+              }
+
+              walk(json['households'] ?? json);
+              return found.values.toList();
+            }
+
+            /// Озвучить текст на устройстве через временный сценарий.
+            Future<void> speak(String deviceId, String text) async {
+              await _token();
+              final headers = {..._h, 'Content-Type': 'application/json'};
+              final create = await http.post(
+                Uri.parse('https://iot.quasar.yandex.ru/m/user/scenarios'),
+                headers: headers,
+                body: jsonEncode({
+                  'name': 'golosa_tmp',
+                  'icon': 'home',
+                  'triggers': [
+                    {'type': 'scenario.trigger.voice', 'value': 'киси голоса'}
+                  ],
+                  'steps': [
+                    {
+                      'type': 'scenarios.steps.actions',
+                      'parameters': {
+                        'requested_speaker_capabilities': [],
+                        'launch_devices': [
+                          {
+                            'id': deviceId,
+                            'capabilities': [
+                              {
+                                'type': 'devices.capabilities.quasar.server_action',
+                                'state': {'instance': 'phrase_action', 'value': text},
+                              }
+                            ],
+                          }
+                        ],
+                      },
+                    }
+                  ],
+                }),
+              );
+              final sid = jsonDecode(create.body)['scenario_id'];
+              if (sid == null) throw Exception('Сценарий не создан (${create.statusCode})');
+              await http.post(
+                Uri.parse('https://iot.quasar.yandex.ru/m/user/scenarios/$sid/actions'),
+                headers: headers,
+              );
+              await http.delete(
+                Uri.parse('https://iot.quasar.yandex.ru/m/user/scenarios/$sid'),
+                headers: headers,
+              );
+            }
+          }
+
+          // ───────────────────────── Вход ─────────────────────────
+
+          class LoginPage extends StatefulWidget {
+            const LoginPage({super.key});
+
+            @override
+            State<LoginPage> createState() => _LoginPageState();
+          }
+
+          class _LoginPageState extends State<LoginPage> {
+            late final WebViewController _web;
+            bool _busy = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _web = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..loadRequest(Uri.parse(
+                    'https://passport.yandex.ru/auth?retpath=https%3A%2F%2Fyandex.ru'));
+            }
+
+            Future<void> _loggedIn() async {
+              setState(() => _busy = true);
+              try {
+                final cm = WebviewCookieManager();
+                final all = <String, String>{};
+                for (final url in [
+                  'https://yandex.ru',
+                  'https://passport.yandex.ru',
+                  'https://iot.quasar.yandex.ru',
+                ]) {
+                  for (final c in await cm.getCookies(url)) {
+                    all[c.name] = c.value;
+                  }
+                }
+                final header = all.entries.map((e) => '${e.key}=${e.value}').join('; ');
+                final api = YandexApi(header);
+                final devices = await api.devices();
+                if (!mounted) return;
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute(builder: (_) => HomePage(api: api, devices: devices)),
+                );
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Вход не найден: $e')),
+                  );
+                }
+              } finally {
+                if (mounted) setState(() => _busy = false);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(
+                    title: const Text('Яндекс ID'),
+                    actions: [
+                      Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: FilledButton(
+                          onPressed: _busy ? null : _loggedIn,
+                          child: _busy
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : const Text('Я вошёл'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  body: WebViewWidget(controller: _web),
+                );
+          }
+
+          // ───────────────────────── Главный экран ─────────────────────────
+
+          class HomePage extends StatefulWidget {
+            const HomePage({super.key, required this.api, required this.devices});
+            final YandexApi api;
+            final List<YDevice> devices;
+
+            @override
+            State<HomePage> createState() => _HomePageState();
+          }
+
+          class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin {
+            final _tts = FlutterTts();
+            final _text = TextEditingController();
+            final _voices = buildVoices();
+            late final AnimationController _dance =
+                AnimationController(vsync: this, duration: const Duration(milliseconds: 450));
+
+            YDevice? _device; // null — динамик телефона / Bluetooth
+            int _voiceIdx = 0;
+            bool _speaking = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _tts.setLanguage('ru-RU');
+              _tts.awaitSpeakCompletion(true);
+            }
+
+            @override
+            void dispose() {
+              _dance.dispose();
+              _text.dispose();
+              super.dispose();
+            }
+
+            Future<void> _say() async {
+              final text = _text.text.trim();
+              if (text.isEmpty || _speaking) return;
+              final v = _voices[_voiceIdx];
+              setState(() => _speaking = true);
+              _dance.repeat(reverse: true);
+              try {
+                if (_device != null) {
+                  await widget.api.speak(_device!.id, text);
+                } else {
+                  await _tts.setVolume(1.0); // максимально громко
+                  await _tts.setSpeechRate(v.rate);
+                  final words = text.split(RegExp(r'\s+'));
+                  for (var i = 0; i < words.length; i += 2) {
+                    final chunk = words.skip(i).take(2).join(' ');
+                    var p = v.pitch;
+                    if (v.dance == 1) p += (i ~/ 2).isEven ? 0.0 : 0.3;
+                    if (v.dance == 2) p += ((i ~/ 2) % 5) * 0.12;
+                    await _tts.setPitch(p.clamp(0.5, 2.0));
+                    await _tts.speak(chunk);
+                  }
+                }
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(SnackBar(content: Text('Ошибка: $e')));
+                }
+              } finally {
+                _dance.stop();
+                if (mounted) setState(() => _speaking = false);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('Яндекс голоса')),
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    Center(
+                      child: AnimatedBuilder(
+                        animation: _dance,
+                        builder: (_, child) => Transform.rotate(
+                          angle: (_dance.value - 0.5) * 0.6,
+                          child: Transform.translate(
+                              offset: Offset(0, -12 * _dance.value), child: child),
+                        ),
+                        child: const Text('🐱', style: TextStyle(fontSize: 64)),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<YDevice?>(
+                      value: _device,
+                      decoration: const InputDecoration(
+                          labelText: 'Устройство', border: OutlineInputBorder()),
+                      items: [
+                        const DropdownMenuItem(
+                            value: null, child: Text('Этот телефон / Bluetooth')),
+                        for (final d in widget.devices)
+                          DropdownMenuItem(value: d, child: Text(d.name)),
+                      ],
+                      onChanged: (d) => setState(() => _device = d),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.bluetooth),
+                      label: const Text('Подключить Bluetooth'),
+                      onPressed: () =>
+                          AppSettings.openAppSettings(type: AppSettingsType.bluetooth),
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _text,
+                      minLines: 2,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                          labelText: 'Любой запрос', border: OutlineInputBorder()),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text('Голоса (20)', style: TextStyle(fontWeight: FontWeight.bold)),
+                    _chips(0, 20),
+                    const SizedBox(height: 12),
+                    const Text('Киси: громкий, танцующий (50)',
+                        style: TextStyle(fontWeight: FontWeight.bold)),
+                    _chips(20, _voices.length),
+                    const SizedBox(height: 24),
+                    FilledButton.icon(
+                      icon: const Icon(Icons.volume_up),
+                      label: Text(_speaking ? 'Говорю…' : 'Сказать'),
+                      onPressed: _speaking ? null : _say,
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _chips(int from, int to) => Wrap(
+                  spacing: 6,
+                  children: [
+                    for (var i = from; i < to; i++)
+                      ChoiceChip(
+                        label: Text(_voices[i].name),
+                        selected: _voiceIdx == i,
+                        onSelected: (_) => setState(() => _voiceIdx = i),
+                      ),
+                  ],
+                );
+          }
+          GOLOSA_EOF
+
+      - name: Add permissions to AndroidManifest
+        working-directory: app
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i '0,/<application/s//<uses-permission android:name="android.permission.INTERNET"\/>\n    <uses-permission android:name="android.permission.BLUETOOTH"\/>\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"\/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"\/>\n    <application/' "$M"
+
+      - name: Build APK
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yandex-golosa-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
